@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 from pathlib import Path
 
@@ -61,8 +60,7 @@ try:
     df, loaded_file_path = load_data()
 except FileNotFoundError:
     st.error("CSV file not found.")
-    st.write("The app could not find the dataset file.")
-    st.write("Please put the CSV file in the same folder as Home.py.")
+    st.write("Please make sure the dataset file exists beside Home.py.")
     st.code("HR_Employee_Attrition.csv")
 
     st.write("Current folder:")
@@ -70,12 +68,6 @@ except FileNotFoundError:
 
     st.write("Home.py folder:")
     st.code(str(Path(__file__).parent))
-
-    try:
-        st.write("Files beside Home.py:")
-        st.write([p.name for p in Path(__file__).parent.iterdir()])
-    except Exception:
-        pass
 
     st.stop()
 
@@ -87,22 +79,44 @@ except FileNotFoundError:
 def prepare_data(df):
     df = df.copy()
 
+    # Clean column names
     df.columns = df.columns.str.strip()
 
     if "Attrition" not in df.columns:
-        st.error("The dataset must contain a column named Attrition.")
-        st.stop()
+        return None, None, None, None, None, None, "Attrition column not found"
 
-    # Convert target column
-    if df["Attrition"].dtype == "object":
-        df["Attrition"] = df["Attrition"].replace({
-            "Yes": 1,
-            "No": 0
-        })
+    # Clean target column safely
+    attrition_clean = df["Attrition"].astype(str).str.strip().str.lower()
 
-    df["Attrition"] = pd.to_numeric(df["Attrition"], errors="coerce")
+    mapped_attrition = attrition_clean.map({
+        "yes": 1,
+        "no": 0,
+        "left": 1,
+        "stayed": 0,
+        "leave": 1,
+        "stay": 0,
+        "1": 1,
+        "0": 0,
+        "true": 1,
+        "false": 0
+    })
+
+    numeric_attrition = pd.to_numeric(attrition_clean, errors="coerce")
+
+    df["Attrition"] = mapped_attrition.combine_first(numeric_attrition)
+
+    # Remove invalid target rows
     df = df.dropna(subset=["Attrition"])
     df["Attrition"] = df["Attrition"].astype(int)
+
+    # Keep only 0 and 1
+    df = df[df["Attrition"].isin([0, 1])]
+
+    if len(df) == 0:
+        return None, None, None, None, None, None, "No valid rows after converting Attrition"
+
+    if df["Attrition"].nunique() < 2:
+        return None, None, None, None, None, None, "Attrition column must contain both Yes and No values"
 
     # Label for charts
     df["Attrition_Label"] = df["Attrition"].map({
@@ -127,16 +141,22 @@ def prepare_data(df):
         errors="ignore"
     )
 
-    # Create default values
+    if X_raw.shape[1] == 0:
+        return None, None, None, None, None, None, "No feature columns found"
+
+    # Default values
     default_values = {}
 
     for col in X_raw.columns:
-        if pd.api.types.is_numeric_dtype(X_raw[col]):
-            median_value = pd.to_numeric(X_raw[col], errors="coerce").median()
+        numeric_col = pd.to_numeric(X_raw[col], errors="coerce")
+
+        if numeric_col.notna().sum() == len(X_raw[col]):
+            median_value = numeric_col.median()
 
             if pd.isna(median_value):
                 median_value = 0
 
+            X_raw[col] = numeric_col
             default_values[col] = median_value
 
         else:
@@ -152,18 +172,28 @@ def prepare_data(df):
     encoders = {}
 
     for col in X_encoded.columns:
-        if pd.api.types.is_numeric_dtype(X_encoded[col]):
-            X_encoded[col] = pd.to_numeric(X_encoded[col], errors="coerce")
-            X_encoded[col] = X_encoded[col].fillna(default_values[col])
+        numeric_col = pd.to_numeric(X_encoded[col], errors="coerce")
+
+        if numeric_col.notna().sum() == len(X_encoded[col]):
+            X_encoded[col] = numeric_col.fillna(default_values[col])
         else:
             le = LabelEncoder()
             X_encoded[col] = le.fit_transform(X_encoded[col].astype(str))
             encoders[col] = le
 
-    return df, X_raw, X_encoded, y, encoders, default_values
+    X_encoded = X_encoded.reset_index(drop=True)
+    y = y.reset_index(drop=True)
+
+    return df, X_raw, X_encoded, y, encoders, default_values, None
 
 
-df, X_raw, X_encoded, y, encoders, default_values = prepare_data(df)
+df, X_raw, X_encoded, y, encoders, default_values, data_error = prepare_data(df)
+
+if data_error is not None:
+    st.error(data_error)
+    st.write("Available columns:")
+    st.write(df.columns.tolist() if df is not None else "No dataframe available")
+    st.stop()
 
 
 # =========================
@@ -171,12 +201,25 @@ df, X_raw, X_encoded, y, encoders, default_values = prepare_data(df)
 # =========================
 @st.cache_resource
 def train_model(X, y):
+    if len(X) < 10:
+        return None, None, "Not enough rows to train the model"
+
+    if y.nunique() < 2:
+        return None, None, "Target column must contain two classes"
+
+    class_counts = y.value_counts()
+
+    if class_counts.min() >= 2:
+        stratify_value = y
+    else:
+        stratify_value = None
+
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
         test_size=0.2,
         random_state=42,
-        stratify=y
+        stratify=stratify_value
     )
 
     model = XGBClassifier(
@@ -194,10 +237,14 @@ def train_model(X, y):
     y_pred = model.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
 
-    return model, accuracy
+    return model, accuracy, None
 
 
-model, accuracy = train_model(X_encoded, y)
+model, accuracy, train_error = train_model(X_encoded, y)
+
+if train_error is not None:
+    st.error(train_error)
+    st.stop()
 
 
 # =========================
@@ -218,8 +265,12 @@ importance = importance.sort_values(
 # SIDEBAR
 # =========================
 st.sidebar.header("Project Info")
+
 st.sidebar.write("Loaded CSV file:")
 st.sidebar.code(loaded_file_path)
+
+st.sidebar.write("Rows:")
+st.sidebar.success(len(df))
 
 st.sidebar.write("Model Accuracy:")
 st.sidebar.success(f"{accuracy:.2%}")
@@ -344,11 +395,15 @@ st.write("Enter employee information below to predict attrition risk.")
 
 
 # =========================
-# HELPER FUNCTIONS
+# HELPER FUNCTION
 # =========================
 def get_options(column_name, fallback_options):
     if column_name in df.columns:
-        return sorted(df[column_name].dropna().astype(str).unique().tolist())
+        values = df[column_name].dropna().astype(str).unique().tolist()
+
+        if len(values) > 0:
+            return sorted(values)
+
     return fallback_options
 
 
@@ -565,7 +620,11 @@ def create_prediction_sample():
     for col in sample.columns:
         if col not in encoders:
             sample[col] = pd.to_numeric(sample[col], errors="coerce")
-            sample[col] = sample[col].fillna(default_values[col])
+
+            if col in default_values:
+                sample[col] = sample[col].fillna(default_values[col])
+            else:
+                sample[col] = sample[col].fillna(0)
 
     # Same order as training data
     sample = sample[X_encoded.columns]
